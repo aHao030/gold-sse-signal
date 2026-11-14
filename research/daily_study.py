@@ -146,5 +146,5 @@ def run() -> str:
     out = REPORTS_DIR / f"daily_study_{pd.Timestamp.now():%Y%m%d}.md"
     out.write_text("\n".join(lines), encoding="utf-8")
     print(f"[study] 报告已生成: {out}")
-    print(f"[study] 全样本 corr={corr_prev:+.4f}, beta t值={res_prev.tvalues[1]:+.2f}, R²={res_prev.rsquared:.4f}")
+    print(f"[study] 全样本 corr={corr_prev:+.4f}, beta t值={res_prev.tvalues[1]:+.2f}, R2={res_prev.rsquared:.4f}")
     return str(out)

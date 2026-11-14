@@ -6,6 +6,7 @@ yfinance 的有限窗口 + 每日增量落库自建。
 from __future__ import annotations
 
 import re
+import time
 
 import numpy as np
 import pandas as pd
@@ -44,6 +45,73 @@ def fetch_daily() -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------- 分钟线
+
+_YAHOO_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+             "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
+_CRUMB_CACHE: dict = {"session": None, "crumb": None}
+
+
+def _yahoo_session(refresh: bool = False) -> tuple:
+    """带 cookie 的会话 + crumb（chart API 偶发 403，带 crumb 实测稳定）。"""
+    if _CRUMB_CACHE["crumb"] and not refresh:
+        return _CRUMB_CACHE["session"], _CRUMB_CACHE["crumb"]
+    s = requests.Session()
+    s.headers.update({"User-Agent": _YAHOO_UA})
+    try:
+        s.get("https://fc.yahoo.com", timeout=15)  # 拿 cookie，404 无所谓
+    except Exception:
+        pass
+    r = s.get("https://query1.finance.yahoo.com/v1/test/getcrumb", timeout=15)
+    crumb = r.text.strip()
+    if r.status_code != 200 or not crumb or len(crumb) > 40:
+        raise RuntimeError(f"获取 Yahoo crumb 失败: {r.status_code} {crumb[:30]!r}")
+    _CRUMB_CACHE.update(session=s, crumb=crumb)
+    return s, crumb
+
+
+def fetch_min_yahoo(interval: str = "5m", start=None, end=None) -> pd.DataFrame:
+    """COMEX 黄金主力 GC=F 分钟线——Yahoo chart API + cookie/crumb（实测 5m 取满 60 天）。
+    Yahoo 限制：1m range 只给 7d 档（有效窗口约 30 天内）；5m 60 天。
+    走系统代理（直连 403）。时间戳转北京时间。start/end 仅保留接口兼容。"""
+    import pandas as pd
+
+    range_map = {"1m": "7d", "5m": "60d", "15m": "60d", "60m": "730d"}
+    last_exc: Exception | None = None
+    r = None
+    for attempt in range(3):
+        try:
+            s, crumb = _yahoo_session(refresh=attempt > 0)
+            r = s.get(
+                "https://query1.finance.yahoo.com/v8/finance/chart/GC%3DF",
+                params={"range": range_map.get(interval, "60d"), "interval": interval,
+                        "includePrePost": "true", "crumb": crumb},
+                timeout=30,
+            )
+            r.raise_for_status()
+            break
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            time.sleep(4 * (attempt + 1))
+    else:
+        raise RuntimeError(f"Yahoo chart 重试 3 次仍失败: {last_exc}")
+    result = (r.json().get("chart") or {}).get("result") or []
+    if not result:
+        raise RuntimeError("Yahoo chart 返回空 result")
+    res = result[0]
+    ts = res.get("timestamp") or []
+    q = ((res.get("indicators") or {}).get("quote") or [{}])[0]
+    df = pd.DataFrame({
+        "ts": ts,
+        "open": q.get("open"), "high": q.get("high"),
+        "low": q.get("low"), "close": q.get("close"),
+        "volume": q.get("volume"),
+    }).dropna(subset=["close"])
+    if df.empty:
+        raise RuntimeError("Yahoo chart 无有效数据")
+    df["datetime"] = pd.to_datetime(df["ts"], unit="s", utc=True).dt.tz_convert(TZ)
+    out = df[["datetime", "open", "high", "low", "close", "volume"]].drop_duplicates("datetime")
+    return _to_num(out.sort_values("datetime").reset_index(drop=True),
+                   ["open", "high", "low", "close", "volume"])
 
 
 def fetch_min_yf(interval: str = "5m", start=None, end=None) -> pd.DataFrame:
@@ -91,11 +159,12 @@ def fetch_min_em(klt: int = 5, lmt: int = 1300) -> pd.DataFrame:
 
 
 def fetch_min(interval: str = "5m", start=None, end=None) -> pd.DataFrame:
-    """分钟线统一入口：yfinance 优先，失败则降级东财（1m→klt=1，5m→klt=5，60m→klt=60）。"""
+    """分钟线统一入口：Yahoo chart API 直连优先 → EM GC00Y 兜底。
+    （yfinance 库限流风险高，不再作为首选）"""
     try:
-        return fetch_min_yf(interval, start=start, end=end)
+        return fetch_min_yahoo(interval, start=start, end=end)
     except Exception as exc:  # noqa: BLE001 - 记录降级原因后尝试备用源
-        print(f"[gold] yfinance {interval} 失败（{exc}），降级东财 GC00Y ...")
+        print(f"[gold] yahoo chart {interval} 失败（{exc}），降级东财 GC00Y ...")
     klt_map = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "60m": 60}
     return fetch_min_em(klt=klt_map.get(interval, 5))
 

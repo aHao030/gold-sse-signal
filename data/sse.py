@@ -25,8 +25,16 @@ def _get(url: str, params: dict) -> dict:
     r.raise_for_status()
     data = (r.json() or {}).get("data")
     if data is None:
-        raise RuntimeError(f"东财返回 data=null: {url} {params}")
+        raise RuntimeError(f"东财返回 data=null（可能被反爬限流）: {url} {params}")
     return data
+
+
+def _trends_trades(params: dict) -> list:
+    data = _get(_TRENDS_URL, params)
+    trades = data.get("trades") or []
+    if not trades:
+        raise RuntimeError(f"trends2 响应无 trades（可能被反爬限流）: {str(data)[:120]}")
+    return trades
 
 
 def fetch_daily(start: str = "19900101", end: str = "22220101") -> pd.DataFrame:
@@ -47,17 +55,48 @@ def fetch_daily(start: str = "19900101", end: str = "22220101") -> pd.DataFrame:
     return df[["date", "open", "high", "low", "close", "volume", "amount"]]
 
 
+def fetch_daily_baostock(start: str = "1990-12-19") -> pd.DataFrame:
+    """上证指数日线——baostock 兜底源（自有 TCP 协议，不经 HTTP 代理，无 token，免费）。
+    东财被反爬封禁时的替代路径。volume 单位为股（与东财的手不同，本项目未使用）。"""
+    import baostock as bs
+
+    lg = bs.login()
+    if lg.error_code != "0":
+        raise RuntimeError(f"baostock 登录失败: {lg.error_msg}")
+    try:
+        rs = bs.query_history_k_data_plus(
+            "sh.000001",
+            "date,open,high,low,close,volume,amount",
+            start_date=start, end_date="2222-01-01",
+            frequency="d", adjustflag="3",
+        )
+        if rs.error_code != "0":
+            raise RuntimeError(f"baostock 查询失败: {rs.error_msg}")
+        rows = []
+        while rs.error_code == "0" and rs.next():
+            rows.append(rs.get_row_data())
+    finally:
+        bs.logout()
+    df = pd.DataFrame(rows, columns=["date", "open", "high", "low", "close",
+                                     "volume", "amount"])
+    df = df[df["open"] != ""]  # 未上市前的空行
+    df["date"] = pd.to_datetime(df["date"])
+    for c in ("open", "high", "low", "close", "volume", "amount"):
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df.reset_index(drop=True)
+
+
 def fetch_min(period: str = "1") -> pd.DataFrame:
     """上证指数分钟线。
     - period="1"：trends2 分时（东财只保留最近约 5 个交易日）
     - period="5" 等：kline klt=5（滚动窗口，实测约 36 个交易日）"""
     if period == "1":
-        data = _get(_TRENDS_URL, {
+        trades = _trends_trades({
             "secid": _SECID, "ndays": 5, "iscr": 0,
             "fields1": "f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13",
             "fields2": "f51,f52,f53,f54,f55,f56,f57,f58",
         })
-        rows = [k.split(",") for k in data["trades"]]
+        rows = [k.split(",") for k in trades]
         df = pd.DataFrame(rows, columns=["datetime", "open", "close", "high",
                                          "low", "volume", "amount", "avg"])
         df["datetime"] = pd.to_datetime(df["datetime"]).dt.tz_localize(TZ)

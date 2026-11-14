@@ -15,7 +15,12 @@ from data import gold, sse, store
 
 
 def sync_sse_daily() -> int:
-    df = sse.fetch_daily()
+    """东财优先；被反爬封禁时自动降级 baostock。"""
+    try:
+        df = sse.fetch_daily()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[sync] 东财日线失败（{type(exc).__name__}），降级 baostock ...")
+        df = sse.fetch_daily_baostock()
     return store.save("sse_daily", df, key="date")
 
 
@@ -32,13 +37,10 @@ def sync_gold_daily() -> int:
 
 
 def sync_gold_minute() -> dict:
-    """GC=F 5m 取近 60 天、1m 取近 8 天（Yahoo 1m 单次请求 ≤7 天）。"""
+    """GC=F：5m 取近 60 天、1m 取近 7 天（Yahoo range 档位）。"""
     out = {}
-    end = pd.Timestamp.now(tz=TZ)
-    start5 = end - pd.Timedelta(days=60)
-    start1 = end - pd.Timedelta(days=8)
-    out["xau_5min"] = store.save("xau_5min", gold.fetch_min("5m", start=start5, end=end))
-    out["xau_1min"] = store.save("xau_1min", gold.fetch_min("1m", start=start1, end=end))
+    out["xau_5min"] = store.save("xau_5min", gold.fetch_min("5m"))
+    out["xau_1min"] = store.save("xau_1min", gold.fetch_min("1m"))
     return out
 
 

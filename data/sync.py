@@ -24,12 +24,23 @@ def sync_sse_daily() -> int:
     return store.save("sse_daily", df, key="date")
 
 
+def _sse_min_with_fallback(period: str) -> pd.DataFrame:
+    """东财分钟优先；被反爬封禁时降级新浪。"""
+    try:
+        return sse.fetch_min(period=period)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[sync] 东财 {period} 分钟失败（{type(exc).__name__}），降级新浪 ...")
+        return sse.fetch_min_sina(period=period)
+
+
 def sync_sse_minute() -> dict:
     time.sleep(2)  # 东财反爬节流
-    n1 = store.save("sse_1min", sse.fetch_min(period="1"))
+    out = {}
+    out["sse_1min"] = store.save("sse_1min", _sse_min_with_fallback("1"))
     time.sleep(2)
-    n5 = store.save("sse_5min", sse.fetch_min(period="5"))
-    return {"sse_1min": n1, "sse_5min": n5}
+    out["sse_5min"] = store.save("sse_5min", _sse_min_with_fallback("5"))
+    out["sse_60min"] = store.save("sse_60min", _sse_min_with_fallback("60"))
+    return out
 
 
 def sync_gold_daily() -> int:

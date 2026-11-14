@@ -86,6 +86,38 @@ def fetch_daily_baostock(start: str = "1990-12-19") -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
+def fetch_min_sina(period: str = "5") -> pd.DataFrame:
+    """新浪 CN_MarketDataService 指数分钟K线（东财被反爬封禁时的兜底，直连稳定）。
+    实测深度：scale=5 约 21 个交易日；scale=60 约 1 年；scale=1 约 5 个交易日。
+    返回体带 `/*<script>...*/` 反爬前缀，需剥离后取 var _=([ ... ]) 的 JSON。"""
+    import json
+    import re
+
+    scale = int(period)
+    url = ("https://quotes.sina.cn/cn/api/jsonp_v2.php/var%20_=/"
+           f"CN_MarketDataService.getKLineData?symbol=sh{SSE_INDEX}&scale={scale}"
+           "&ma=no&datalen=1023")
+    r = requests.get(url, headers={
+        "Referer": "https://finance.sina.com.cn/",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+    }, timeout=20)
+    r.raise_for_status()
+    m = re.search(r"var _=\((.*)\);?\s*$", r.text, re.S)
+    if not m:
+        raise RuntimeError(f"新浪分钟K线响应异常: {r.text[:100]!r}")
+    items = json.loads(m.group(1))
+    if not items:
+        raise RuntimeError("新浪分钟K线为空")
+    df = pd.DataFrame(items)
+    df = df.rename(columns={"day": "datetime"})
+    df["datetime"] = pd.to_datetime(df["datetime"]).dt.tz_localize(TZ)
+    for c in ("open", "high", "low", "close", "volume"):
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["amount"] = float("nan")
+    return df[["datetime", "open", "high", "low", "close", "volume", "amount"]]
+
+
 def fetch_min(period: str = "1") -> pd.DataFrame:
     """上证指数分钟线。
     - period="1"：trends2 分时（东财只保留最近约 5 个交易日）

@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# 本地数据与日志（体积大且每日增长，不上传）
+data_store/
+
+# IDE
+.idea/
+.vscode/

@@ -1,0 +1,72 @@
+"""每日增量同步：把各数据源最新数据合并进本地 parquet（幂等，可重复跑）。
+
+用法：收盘后（建议 15:10 之后）运行 scripts/sync_daily.py。
+注意：东财接口有反爬 IP 软封禁（RemoteDisconnected），这里对东财请求做了
+间隔节流；若仍被封，等 5~40 分钟再跑，不要连续重试。
+"""
+from __future__ import annotations
+
+import time
+
+import pandas as pd
+
+from config import TZ
+from data import gold, sse, store
+
+
+def sync_sse_daily() -> int:
+    df = sse.fetch_daily()
+    return store.save("sse_daily", df, key="date")
+
+
+def sync_sse_minute() -> dict:
+    time.sleep(2)  # 东财反爬节流
+    n1 = store.save("sse_1min", sse.fetch_min(period="1"))
+    time.sleep(2)
+    n5 = store.save("sse_5min", sse.fetch_min(period="5"))
+    return {"sse_1min": n1, "sse_5min": n5}
+
+
+def sync_gold_daily() -> int:
+    return store.save("xau_daily", gold.fetch_daily(), key="date")
+
+
+def sync_gold_minute() -> dict:
+    """GC=F 5m 取近 60 天、1m 取近 8 天（Yahoo 1m 单次请求 ≤7 天）。"""
+    out = {}
+    end = pd.Timestamp.now(tz=TZ)
+    start5 = end - pd.Timedelta(days=60)
+    start1 = end - pd.Timedelta(days=8)
+    out["xau_5min"] = store.save("xau_5min", gold.fetch_min("5m", start=start5, end=end))
+    out["xau_1min"] = store.save("xau_1min", gold.fetch_min("1m", start=start1, end=end))
+    return out
+
+
+def sync_all() -> dict:
+    """全部同步；单一数据源失败不影响其余（错误计入 summary["errors"]）。"""
+    summary: dict = {}
+    errors: dict = {}
+
+    steps = [
+        ("sse_daily", sync_sse_daily, {}),
+        ("xau_daily", sync_gold_daily, {}),
+        ("sse_minute", sync_sse_minute, None),
+        ("gold_minute", sync_gold_minute, None),
+    ]
+    for name, fn, _ in steps:
+        try:
+            r = fn()
+            if isinstance(r, dict):
+                summary.update(r)
+            else:
+                summary[name] = r
+        except Exception as exc:  # noqa: BLE001
+            errors[name] = f"{type(exc).__name__}: {str(exc)[:120]}"
+        time.sleep(1)
+
+    if errors:
+        summary["errors"] = errors
+    print("--- 同步汇总（新增行数） ---")
+    for k, v in summary.items():
+        print(f"  {k}: {v}")
+    return summary

@@ -48,25 +48,33 @@ def fetch_daily() -> pd.DataFrame:
 
 _YAHOO_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
              "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
+_YAHOO_HOSTS = ["https://query1.finance.yahoo.com", "https://query2.finance.yahoo.com"]
 _CRUMB_CACHE: dict = {"session": None, "crumb": None}
 
 
 def _yahoo_session(refresh: bool = False) -> tuple:
-    """带 cookie 的会话 + crumb（chart API 偶发 403，带 crumb 实测稳定）。"""
+    """带 cookie 的会话 + crumb；query1 被拒时换 query2（实测两域名限流池不同）。"""
     if _CRUMB_CACHE["crumb"] and not refresh:
         return _CRUMB_CACHE["session"], _CRUMB_CACHE["crumb"]
     s = requests.Session()
-    s.headers.update({"User-Agent": _YAHOO_UA})
+    s.headers.update({"User-Agent": _YAHOO_UA, "Accept-Language": "en-US,en;q=0.9"})
     try:
         s.get("https://fc.yahoo.com", timeout=15)  # 拿 cookie，404 无所谓
     except Exception:
         pass
-    r = s.get("https://query1.finance.yahoo.com/v1/test/getcrumb", timeout=15)
-    crumb = r.text.strip()
-    if r.status_code != 200 or not crumb or len(crumb) > 40:
-        raise RuntimeError(f"获取 Yahoo crumb 失败: {r.status_code} {crumb[:30]!r}")
-    _CRUMB_CACHE.update(session=s, crumb=crumb)
-    return s, crumb
+    last_err = ""
+    for host in _YAHOO_HOSTS:
+        try:
+            r = s.get(f"{host}/v1/test/getcrumb", timeout=15)
+        except Exception as exc:  # noqa: BLE001
+            last_err = str(exc)[:100]
+            continue
+        crumb = r.text.strip()
+        if r.status_code == 200 and crumb and len(crumb) <= 40:
+            _CRUMB_CACHE.update(session=s, crumb=crumb)
+            return s, crumb
+        last_err = f"{r.status_code} {crumb[:30]!r}"
+    raise RuntimeError(f"获取 Yahoo crumb 失败: {last_err}")
 
 
 def fetch_min_yahoo(interval: str = "5m", start=None, end=None) -> pd.DataFrame:
@@ -78,22 +86,26 @@ def fetch_min_yahoo(interval: str = "5m", start=None, end=None) -> pd.DataFrame:
     range_map = {"1m": "7d", "5m": "60d", "15m": "60d", "60m": "730d"}
     last_exc: Exception | None = None
     r = None
-    for attempt in range(3):
+    for attempt in range(4):
         try:
             s, crumb = _yahoo_session(refresh=attempt > 0)
-            r = s.get(
-                "https://query1.finance.yahoo.com/v8/finance/chart/GC%3DF",
-                params={"range": range_map.get(interval, "60d"), "interval": interval,
-                        "includePrePost": "true", "crumb": crumb},
-                timeout=30,
-            )
+            r = None
+            for host in _YAHOO_HOSTS:  # query1 被拒换 query2
+                r = s.get(
+                    f"{host}/v8/finance/chart/GC%3DF",
+                    params={"range": range_map.get(interval, "60d"), "interval": interval,
+                            "includePrePost": "true", "crumb": crumb},
+                    timeout=30,
+                )
+                if r.status_code == 200:
+                    break
             r.raise_for_status()
             break
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
             time.sleep(4 * (attempt + 1))
     else:
-        raise RuntimeError(f"Yahoo chart 重试 3 次仍失败: {last_exc}")
+        raise RuntimeError(f"Yahoo chart 重试 4 次仍失败: {last_exc}")
     result = (r.json().get("chart") or {}).get("result") or []
     if not result:
         raise RuntimeError("Yahoo chart 返回空 result")
